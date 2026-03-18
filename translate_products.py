@@ -78,21 +78,32 @@ def translate_intro(
         "4. Return JSON with keys: english, chinese, spanish. Do not include any other text."
     )
 
-    completion = client.chat.completions.create(
-        model="gpt-4.1-mini",
-        response_format={"type": "json_object"},
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        temperature=0.4,
-    )
+    # 최대 2회 재시도, 요청당 30초 타임아웃
+    last_exc: Exception | None = None
+    for attempt in range(1, 3):
+        try:
+            completion = client.chat.completions.create(
+                model="gpt-4o-mini",
+                response_format={"type": "json_object"},
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0.4,
+                timeout=30.0,
+            )
+            break
+        except Exception as exc:
+            last_exc = exc
+            print(f"    [재시도 {attempt}/2] 오류: {exc}")
+    else:
+        raise RuntimeError(f"번역 실패 (2회 재시도 초과): {last_exc}")
+
+    import json
 
     content = completion.choices[0].message.content
     if not content:
         raise RuntimeError("번역 결과를 받지 못했습니다.")
-
-    import json
 
     data = json.loads(content)
 
@@ -252,27 +263,39 @@ def main() -> None:
     client = build_client()
     products = read_products(csv_path)
 
-    # 데모 및 비용 절감을 위해 상위 몇 개만 번역하고 싶다면 아래 max_count 값을 조정
+    # 번역할 최대 행 수 (.env의 MAX_TRANSLATE_ROWS로 조절)
     max_count = int(os.environ.get("MAX_TRANSLATE_ROWS", "20"))
+    translate_targets = [p for p in products if p.kor_intro][:max_count]
+    no_translate = [p for p in products if not p.kor_intro]
+
+    print(f"총 {len(products)}개 제품 로드 완료.")
+    print(f"번역 대상: {len(translate_targets)}개 / 나머지 {len(no_translate)}개는 번역 생략\n")
+
     translated_products: List[ProductIntro] = []
+    success = 0
+    fail = 0
 
-    for idx, product in enumerate(products):
-        if not product.kor_intro:
-            translated_products.append(product)
-            continue
-
-        if idx >= max_count:
-            translated_products.append(product)
-            continue
-
-        translations = translate_intro(client, product.kor_intro)
-        product.translations = translations
+    for idx, product in enumerate(translate_targets, start=1):
+        print(f"[{idx:>3}/{len(translate_targets)}] {product.code} | {product.name} 번역 중...", end=" ", flush=True)
+        try:
+            product.translations = translate_intro(client, product.kor_intro)
+            print("완료")
+            success += 1
+        except Exception as exc:
+            print(f"실패 → {exc}")
+            fail += 1
         translated_products.append(product)
+
+    # 번역 생략 행도 결과에 포함
+    translated_products.extend(no_translate)
+    # 원래 순서(No 기준) 복원
+    translated_products.sort(key=lambda p: int(p.no) if p.no.isdigit() else 0)
 
     html = generate_html(translated_products)
     with open(output_html, "w", encoding="utf-8") as f:
         f.write(html)
 
+    print(f"\n번역 완료: 성공 {success}개 / 실패 {fail}개")
     print(f"HTML 결과가 생성되었습니다: {output_html}")
 
 
